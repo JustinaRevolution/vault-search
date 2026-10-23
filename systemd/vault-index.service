@@ -1,0 +1,9 @@
+[Unit]
+Description=Incremental re-index of Obsidian vaults for semantic search
+Requires=vault-embed.service
+After=vault-embed.service
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/bin/env python3 %h/.local/share/vault-search/vault_search.py index

@@ -1,0 +1,2 @@
+numpy>=1.24
+mcp>=1.2   # only needed for `serve` (MCP); works with SDK 1.x and 2.x

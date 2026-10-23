@@ -1,0 +1,10 @@
+[Unit]
+Description=CPU embedding server for vault search (EmbeddingGemma on CPU)
+
+[Service]
+ExecStart=%h/.local/bin/llama-server -m %h/models/embeddinggemma-2-UD-Q4_K_XL.gguf --embedding --pooling mean --n-gpu-layers 0 --threads 6 --ctx-size 8192 --batch-size 2048 --ubatch-size 2048 -np 4 --host 127.0.0.1 --port 8096
+Restart=on-failure
+Nice=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly vault re-index (02:30)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,6 @@
+# The index contains the text of your notes. Never commit it.
+*.db
+*.db-*
+*.sqlite
+__pycache__/
+vaults.json
