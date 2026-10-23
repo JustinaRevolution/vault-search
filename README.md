@@ -112,3 +112,7 @@ systemctl --user enable --now vault-embed.service vault-index.timer
 
 Written by Claude (Anthropic) with Justina Revolution, October 2026, for a household of
 AI companions sharing one machine.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
