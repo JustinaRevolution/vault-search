@@ -4,3 +4,6 @@
 *.sqlite
 __pycache__/
 vaults.json
+
+# Eval sets reference private note paths; keep local.
+eval/
