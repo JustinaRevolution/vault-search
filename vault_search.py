@@ -46,6 +46,11 @@ def load_vaults() -> dict[str, Path]:
 VAULTS = load_vaults()
 DB_PATH = Path(os.environ.get("VAULT_SEARCH_DB", HOME / ".local/share/vault-search/index.db"))
 EMBED_URL = os.environ.get("VAULT_EMBED_URL", "http://127.0.0.1:8096/v1/embeddings")
+# Optional cross-encoder reranker (llama-server --reranking). Empty string disables.
+RERANK_URL = os.environ.get("VAULT_RERANK_URL", "http://127.0.0.1:8095/v1/rerank")
+RERANK_CANDIDATES = int(os.environ.get("VAULT_RERANK_CANDIDATES", "20"))
+# 0 = pure reranker order; >0 = reciprocal-rank fusion of vector rank and rerank rank with this k.
+RERANK_FUSION_K = float(os.environ.get("VAULT_RERANK_FUSION_K", "5"))
 SKIP_DIRS = {".obsidian", ".trash", ".git", "node_modules"}
 MAX_CHARS = 1400      # ~350-450 tokens; well inside the 2048 ctx
 MIN_CHARS = 40
@@ -191,7 +196,32 @@ def index(full: bool = False, log=print) -> dict:
 
 
 # ---------------------------------------------------------------- search
-def search(query: str, k: int = 8, vault: str | None = None) -> list[dict]:
+def _defuse(text: str) -> str:
+    """llama.cpp fills the rerank template by plain text replacement, so a literal
+    {query}/{document} inside our text would be substituted (llama.cpp #30816).
+    A zero-width joiner inside the braces breaks the match without changing meaning."""
+    return text.replace("{document}", "{\u200ddocument}").replace("{query}", "{\u200dquery}")
+
+
+def rerank(query: str, docs: list[str]) -> list[float] | None:
+    """Relevance score per doc from the reranker, or None if it's unavailable."""
+    if not RERANK_URL or not docs:
+        return None
+    body = json.dumps({"query": _defuse(query), "documents": [_defuse(d) for d in docs]}).encode()
+    req = urllib.request.Request(RERANK_URL, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            results = json.load(r)["results"]
+    except Exception:
+        return None  # degrade gracefully to vector order
+    scores = [0.0] * len(docs)
+    for item in results:
+        scores[item["index"]] = float(item["relevance_score"])
+    return scores
+
+
+def search(query: str, k: int = 8, vault: str | None = None, use_rerank: bool = True,
+           thorough: bool = False) -> list[dict]:
     con = db()
     sql = "SELECT path, vault, heading, text, emb FROM chunks" + (" WHERE vault=?" if vault else "")
     rows = con.execute(sql, (vault,) if vault else ()).fetchall()
@@ -201,20 +231,49 @@ def search(query: str, k: int = 8, vault: str | None = None) -> list[dict]:
     mat = np.frombuffer(b"".join(r[4] for r in rows), dtype=np.float32).reshape(len(rows), -1)
     scores = mat @ q
     order = np.argsort(-scores)
-    out, per_file = [], {}
+
+    # Stage 1: vector candidates (up to 3 chunks per note so the reranker can pick the best one)
+    n_cand = max(k, 40 if thorough else RERANK_CANDIDATES) if use_rerank else k * 3
+    cands, per_file = [], {}
     for idx in order:
+        path = rows[idx][0]
+        if per_file.get(path, 0) >= 3:
+            continue
+        per_file[path] = per_file.get(path, 0) + 1
+        cands.append((int(idx), float(scores[idx])))
+        if len(cands) >= n_cand:
+            break
+
+    # Stage 2: cross-encoder rerank (falls back to vector order if the reranker is down)
+    reranked = False
+    if use_rerank:
+        docs = [f"{Path(rows[i][0]).stem}\n{rows[i][2] or ''}\n{rows[i][3]}" for i, _ in cands]
+        rs = rerank(query, docs)
+        if rs is not None:
+            if RERANK_FUSION_K > 0 and not thorough:
+                rr_rank = {c[0]: r for r, c in enumerate(sorted(zip([c[0] for c in cands], rs), key=lambda t: -t[1]))}
+                fused = [(i, 1 / (RERANK_FUSION_K + vr + 1) + 1 / (RERANK_FUSION_K + rr_rank[i] + 1))
+                         for vr, (i, _) in enumerate(cands)]
+                cands = sorted(fused, key=lambda t: -t[1])
+            else:
+                cands = sorted(((i, r) for (i, _), r in zip(cands, rs)), key=lambda t: -t[1])
+            reranked = True
+
+    out, per_file = [], {}
+    for idx, score in cands:
         path = rows[idx][0]
         if per_file.get(path, 0) >= 2:  # at most 2 chunks per note, for variety
             continue
         per_file[path] = per_file.get(path, 0) + 1
         p, v, h, t, _ = rows[idx]
-        root = VAULTS[v]
+        root = VAULTS.get(v)
         snippet = re.sub(r"\s+", " ", t).strip()
         out.append({
             "vault": v,
-            "path": str(Path(p).relative_to(root)) if p.startswith(str(root)) else p,
+            "path": str(Path(p).relative_to(root)) if root and p.startswith(str(root)) else p,
             "heading": h or "",
-            "score": round(float(scores[idx]), 3),
+            "score": round(score, 3),
+            "ranker": "rerank" if reranked else "vector",
             "snippet": snippet[:300] + ("…" if len(snippet) > 300 else ""),
         })
         if len(out) >= k:
@@ -232,14 +291,17 @@ def serve() -> None:
     mcp = FastMCP("vault-search")
 
     @mcp.tool()
-    def vault_search(query: str, k: int = 8, vault: str = "all") -> str:
+    def vault_search(query: str, k: int = 8, vault: str = "all", thorough: bool = False) -> str:
         """Semantic search over the configured Markdown vaults by meaning, not exact words.
-        vault: 'all' or one configured vault name. Returns path (relative to the vault root),
-        heading, similarity score, and a snippet."""
+        vault: 'all' or one configured vault name. Results are reranked by a local cross-encoder
+        (~3 s). thorough=true reranks twice as many candidates purely by the cross-encoder
+        (~6 s); better for specific facts buried inside notes. Returns path (relative to the
+        vault root), heading, score, and a snippet."""
         v = None if vault in ("all", "", None) else vault
         if v and v not in VAULTS:
             return json.dumps({"error": f"vault must be 'all' or one of: {', '.join(VAULTS)}"})
-        return json.dumps({"query": query, "results": search(query, max(1, min(int(k), 25)), v)}, ensure_ascii=False)
+        return json.dumps({"query": query, "results": search(query, max(1, min(int(k), 25)), v, thorough=thorough)},
+                          ensure_ascii=False)
 
     @mcp.tool()
     def vault_reindex(full: bool = False) -> str:
@@ -255,12 +317,14 @@ def main() -> None:
     i = sub.add_parser("index"); i.add_argument("--full", action="store_true")
     s = sub.add_parser("search"); s.add_argument("query"); s.add_argument("-k", type=int, default=8)
     s.add_argument("--vault", choices=list(VAULTS))
+    s.add_argument("--no-rerank", action="store_true")
+    s.add_argument("--thorough", action="store_true")
     sub.add_parser("serve")
     a = ap.parse_args()
     if a.cmd == "index":
         print(json.dumps(index(full=a.full), indent=2))
     elif a.cmd == "search":
-        for r in search(a.query, a.k, a.vault):
+        for r in search(a.query, a.k, a.vault, use_rerank=not a.no_rerank, thorough=a.thorough):
             print(f"{r['score']:.3f}  [{r['vault']}] {r['path']}  § {r['heading']}\n       {r['snippet'][:160]}")
     else:
         serve()

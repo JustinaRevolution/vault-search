@@ -23,8 +23,14 @@ $ vault_search.py search "what makes a self count as a self" -k 2
   `title: … | text:` for documents).
 - **Index:** a single SQLite file. Incremental: only notes whose size or mtime changed
   are re-embedded, so nightly reindexing takes seconds.
-- **Search:** brute-force cosine similarity in NumPy (fast enough for tens of thousands
-  of chunks), at most two chunks per note so results stay varied.
+- **Search, stage 1:** brute-force cosine similarity in NumPy (fast enough for tens of
+  thousands of chunks) picks candidates, up to 3 chunks per note.
+- **Search, stage 2 (optional):** a cross-encoder reranker
+  ([Qwen3-Reranker-0.6B](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF), via
+  `llama-server --reranking`) rescores the top 20 candidates; its ranking is fused with the
+  vector ranking (reciprocal-rank fusion, k=5). `thorough` mode reranks 40 candidates purely
+  by the cross-encoder. If the reranker is down, search silently falls back to vector order.
+  Results show at most two chunks per note so they stay varied.
 - **Skips** `.obsidian`, `.trash`, `.git`, `node_modules`, and YAML frontmatter.
 
 Reference scale: ~1,500 notes / ~6,400 chunks indexed in about 2.5 minutes on a laptop CPU
@@ -46,6 +52,16 @@ Reference scale: ~1,500 notes / ~6,400 chunks indexed in about 2.5 minutes on a 
    > on the GPU. A small dedicated CPU instance (~530 MB RAM) avoids that entirely.
    > Point elsewhere with `VAULT_EMBED_URL`.
 
+   Optional reranker (another small CPU server, ~700 MB RAM). Use the official ggml-org
+   conversion: many community Qwen3-Reranker GGUFs lack the classifier tensors and return
+   garbage scores.
+
+   ```bash
+   llama-server -m qwen3-reranker-0.6b-q8_0.gguf --reranking --pooling rank \
+     --n-gpu-layers 0 --threads 6 --ctx-size 16384 --batch-size 2048 --ubatch-size 2048 \
+     -np 8 --host 127.0.0.1 --port 8095
+   ```
+
 2. **Dependencies:** `pip install -r requirements.txt` (NumPy; the `mcp` SDK only for `serve`).
 
 3. **Tell it where your vaults are**: `~/.config/vault-search/vaults.json`
@@ -60,7 +76,7 @@ Reference scale: ~1,500 notes / ~6,400 chunks indexed in about 2.5 minutes on a 
 ## Usage
 
 ```bash
-python3 vault_search.py search "query" [-k 8] [--vault notes]
+python3 vault_search.py search "query" [-k 8] [--vault notes] [--thorough] [--no-rerank]
 python3 vault_search.py index [--full]
 python3 vault_search.py serve          # stdio MCP server
 ```
@@ -69,7 +85,7 @@ python3 vault_search.py serve          # stdio MCP server
 
 Tools:
 
-- `vault_search(query, k=8, vault="all")`: path, heading, score, snippet
+- `vault_search(query, k=8, vault="all", thorough=false)`: path, heading, score, snippet
 - `vault_reindex(full=false)`: re-embed changed notes
 
 Example client config (stdio):
@@ -84,6 +100,7 @@ mcp_servers:
 ### Keeping it fresh (systemd user units)
 
 `systemd/` has templates: `vault-embed.service` (the CPU embedding server),
+`vault-rerank.service` (the CPU reranker),
 `vault-index.service` + `vault-index.timer` (nightly incremental reindex at 02:30).
 Adjust paths, copy them to `~/.config/systemd/user/`, then:
 
@@ -91,6 +108,23 @@ Adjust paths, copy them to `~/.config/systemd/user/`, then:
 systemctl --user daemon-reload
 systemctl --user enable --now vault-embed.service vault-index.timer
 ```
+
+## Measuring changes
+
+`eval.py` scores search against a JSONL file of `{"query": "...", "gold": ["path substring", ...]}`
+and reports hit@1/5/10 and MRR@10. Build one from questions you've really asked.
+
+On our own vaults (~1,500 notes; 28 everyday + 12 hard "fact buried mid-note" questions;
+small sets, so one question ≈ 4–8 points):
+
+| Mode | Everyday hit@1 / MRR | Hard hit@1 / hit@5 / MRR | Latency (laptop CPU) |
+|---|---|---|---|
+| Vector only | 0.89 / 0.93 | 0.50 / 0.92 / 0.69 | 0.15 s |
+| Rerank 20, fused (default) | 0.89 / 0.93 | 0.58 / 0.92 / 0.74 | 3.3 s |
+| Rerank 40, pure (`thorough`) | 0.86 / 0.89 | 0.67 / 1.00 / 0.80 | 6.5 s |
+
+The reranker's value is on hard, specific questions; on name/topic lookups vectors were
+already near the ceiling.
 
 ## Privacy
 
@@ -107,6 +141,9 @@ systemctl --user enable --now vault-embed.service vault-index.timer
 | `VAULT_SEARCH_CONFIG` | `~/.config/vault-search/vaults.json` |
 | `VAULT_SEARCH_DB` | `~/.local/share/vault-search/index.db` |
 | `VAULT_EMBED_URL` | `http://127.0.0.1:8096/v1/embeddings` |
+| `VAULT_RERANK_URL` | `http://127.0.0.1:8095/v1/rerank` (empty = no reranking) |
+| `VAULT_RERANK_CANDIDATES` | `20` |
+| `VAULT_RERANK_FUSION_K` | `5` (0 = pure reranker order) |
 
 ## Credits
 
